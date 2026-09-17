@@ -1,0 +1,101 @@
+import { Pool } from "pg";
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import "dotenv/config";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+
+const CONFIDENCE_THRESHOLD = 0.65;
+
+async function embedQuery(text: string): Promise<number[]> {
+  const model = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
+  const result = await model.embedContent({
+    content: { role: "user", parts: [{ text }] },
+    outputDimensionality: 768,
+  } as any);
+  return result.embedding.values;
+}
+
+async function findBestMatch(embedding: number[]) {
+  const vectorLiteral = `[${embedding.join(",")}]`;
+  const { rows } = await pool.query(
+    `select id, myth, fact, category,
+            (1 - (embedding <=> $1::vector)) as similarity
+     from fact_library
+     where embedding is not null
+     order by embedding <=> $1::vector asc
+     limit 1`,
+    [vectorLiteral]
+  );
+  return rows[0] ?? null;
+}
+
+async function generateReply(fact: string, source: string, userQuestion: string): Promise<string> {
+  const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+  const prompt = `You are a WhatsApp health-information assistant for Nigerian users, replying in plain, warm, simple language (mix of English and Pidgin is fine if the user's question suggests it). 
+A user asked: "${userQuestion}"
+The verified fact to base your reply on is: "${fact}"
+Source: ${source}
+
+Write a short, clear, non-judgmental reply (3-5 sentences max) that corrects the misinformation gently and cites the source. Do not lecture. Do not use complicated medical jargon.`;
+
+  const result = await model.generateContent(prompt);
+  return result.response.text();
+}
+
+async function logSubmission(phoneNumber: string, rumorText: string) {
+  await pool.query(
+    `insert into submissions (phone_number, rumor_text, status) values ($1, $2, 'pending')`,
+    [phoneNumber, rumorText]
+  );
+}
+
+async function logQuery(
+  phoneNumber: string,
+  questionText: string,
+  matchedFactId: number | null,
+  confidenceScore: number,
+  escalated: boolean
+) {
+  await pool.query(
+    `insert into queries_log (phone_number, question_text, matched_fact_id, confidence_score, escalated)
+     values ($1, $2, $3, $4, $5)`,
+    [phoneNumber, questionText, matchedFactId, confidenceScore, escalated]
+  );
+}
+
+export async function handleIncomingQuestion(phoneNumber: string, questionText: string): Promise<string> {
+  const embedding = await embedQuery(questionText);
+  const match = await findBestMatch(embedding);
+
+  const similarity = match ? parseFloat(match.similarity) : 0;
+
+  if (match && similarity >= CONFIDENCE_THRESHOLD) {
+    const reply = await generateReply(match.fact, match.category ?? "verified health source", questionText);
+    await logQuery(phoneNumber, questionText, match.id, similarity, false);
+    return reply;
+  } else {
+    await logSubmission(phoneNumber, questionText);
+    await logQuery(phoneNumber, questionText, null, similarity, true);
+    return "I don't have a confirmed answer for that yet — I've logged it for review by our team. In the meantime, please check with a qualified health worker for advice on this.";
+  }
+}
+
+// CLI test runner: bun run pipeline-test.ts "your question here"
+if (import.meta.main) {
+  const question = process.argv[2] ?? "is it true that vaccines cause infertility";
+  const testPhoneNumber = "test-cli-user";
+
+  console.log(`\n🧪 Testing full pipeline with: "${question}"\n`);
+  handleIncomingQuestion(testPhoneNumber, question)
+    .then((reply) => {
+      console.log("🤖 Bot reply:\n");
+      console.log(reply);
+      console.log("\n✅ Done. Check queries_log / submissions in Supabase to confirm logging.\n");
+      process.exit(0);
+    })
+    .catch((err) => {
+      console.error("❌ Pipeline error:", err);
+      process.exit(1);
+    });
+}
