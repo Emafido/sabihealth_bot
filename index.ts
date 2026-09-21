@@ -51,6 +51,19 @@ app.post("/webhook", (req: Request, res: Response) => {
     return;
   }
 
+  if (text === "/start") {
+    const introMessage =
+      "🌿 Welcome to SabiHealth!\n\n" +
+      "Heard a health claim from a friend, family member, or online and not sure if it's true? Just type it here in plain English or Pidgin, and I'll check it against verified facts from WHO, NCDC, and NPHCDA.\n\n" +
+      "If I'm not sure, I'll say so honestly instead of guessing — and I'll flag it for our team to look into.\n\n" +
+      "Try something like:\n" +
+      "\"My aunty said herbs can cure malaria instead of drugs\"";
+    sendTelegramMessage(chatId, introMessage).catch((err) =>
+      console.error(`❌ Failed to send intro message to chat ${chatId}:`, err)
+    );
+    return;
+  }
+
   (async () => {
     try {
       console.log(`⏳ Processing query for chat ${chatId}...`);
