@@ -39,8 +39,7 @@ async function backfillEmbeddings() {
 
     // Fetch all facts from fact_library
     console.log("🔍 Fetching rows from fact_library...");
-    const result = await client.query("SELECT id, myth FROM fact_library ORDER BY id ASC;");
-
+    const result = await client.query("SELECT id, myth FROM fact_library WHERE embedding IS NULL ORDER BY id ASC;");
     if (result.rows.length === 0) {
       console.warn("⚠️  No rows found in fact_library table. Please ensure your facts are inserted first.");
       return;

@@ -21,6 +21,13 @@ async function withRetry<T>(fn: () => Promise<T>, retries = 2, delayMs = 1000): 
   }
 }
 
+// Fast-path: catch obvious greetings without any API call at all
+const GREETING_PATTERN = /^(hi|hello|hey|good\s?(morning|afternoon|evening|day)|how\s?far|howdy|sup|yo|thanks|thank\s?you)\b[\s!.?]*$/i;
+
+function isObviousGreeting(text: string): boolean {
+  return GREETING_PATTERN.test(text.trim());
+}
+
 async function embedQuery(text: string): Promise<number[]> {
   return withRetry(async () => {
     const model = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
@@ -34,16 +41,18 @@ async function embedQuery(text: string): Promise<number[]> {
 
 async function classifyIntent(text: string): Promise<"GREETING" | "MEDICAL" | "OTHER"> {
   return withRetry(async () => {
-    const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-    const prompt = `Classify the following message into exactly ONE of these categories. Reply with ONLY the category word, nothing else.
+    const model = genAI.getGenerativeModel({
+      model: "gemini-flash-latest",
+      generationConfig: { maxOutputTokens: 5 }, // force a fast, short response
+    });
+    const prompt = `Classify this message into exactly ONE word: GREETING, MEDICAL, or OTHER.
 
-GREETING - if it's a greeting, small talk, or pleasantry (e.g. "hi", "hello", "good morning", "how are you", "thanks")
-MEDICAL - if it mentions, asks about, or claims something related to health, illness, medicine, treatment, symptoms, or a health rumor
-OTHER - anything else not related to health (e.g. asking for directions, prices, jokes, general chit-chat unrelated to health)
+GREETING - greeting or pleasantry (e.g. "hi", "how are you", "thanks")
+MEDICAL - mentions health, illness, medicine, treatment, symptoms, or a health rumor/claim
+OTHER - anything else unrelated to health
 
 Message: "${text}"
-
-Category:`;
+Category (one word only):`;
 
     const result = await model.generateContent(prompt);
     const label = result.response.text().trim().toUpperCase();
@@ -105,7 +114,17 @@ async function logQuery(
 }
 
 export async function handleIncomingQuestion(phoneNumber: string, questionText: string): Promise<string> {
-  const intent = await classifyIntent(questionText);
+  // Fast path: skip all API calls for obvious greetings
+  if (isObviousGreeting(questionText)) {
+    return "Hello! 🌿 I'm SabiHealth. Send me any health claim or rumor you've heard, and I'll check it against verified facts. For example: \"my aunty said herbs can cure malaria instead of drugs.\"";
+  }
+
+  // Run classification and embedding in parallel — they're independent of each other,
+  // so no need to wait for one before starting the other.
+  const [intent, embedding] = await Promise.all([
+    classifyIntent(questionText),
+    embedQuery(questionText),
+  ]);
 
   if (intent === "GREETING") {
     return "Hello! 🌿 I'm SabiHealth. Send me any health claim or rumor you've heard, and I'll check it against verified facts. For example: \"my aunty said herbs can cure malaria instead of drugs.\"";
@@ -115,9 +134,7 @@ export async function handleIncomingQuestion(phoneNumber: string, questionText: 
     return "I'm built specifically to check health claims and rumors — that one's outside what I can help with. Try asking me something like a health rumor you've heard, and I'll check it against verified facts.";
   }
 
-  const embedding = await embedQuery(questionText);
   const match = await findBestMatch(embedding);
-
   const similarity = match ? parseFloat(match.similarity) : 0;
 
   if (match && similarity >= CONFIDENCE_THRESHOLD) {
@@ -137,11 +154,13 @@ if (import.meta.main) {
   const testPhoneNumber = "test-cli-user";
 
   console.log(`\n🧪 Testing full pipeline with: "${question}"\n`);
+  const start = Date.now();
   handleIncomingQuestion(testPhoneNumber, question)
     .then((reply) => {
       console.log("🤖 Bot reply:\n");
       console.log(reply);
-      console.log("\n✅ Done. Check queries_log / submissions in Supabase to confirm logging.\n");
+      console.log(`\n⏱️  Took ${Date.now() - start}ms`);
+      console.log("✅ Done. Check queries_log / submissions in Supabase to confirm logging.\n");
       process.exit(0);
     })
     .catch((err) => {
