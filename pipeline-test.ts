@@ -16,6 +16,26 @@ async function embedQuery(text: string): Promise<number[]> {
   return result.embedding.values;
 }
 
+async function classifyIntent(text: string): Promise<"GREETING" | "MEDICAL" | "OTHER"> {
+  const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
+  const prompt = `Classify the following message into exactly ONE of these categories. Reply with ONLY the category word, nothing else.
+
+GREETING - if it's a greeting, small talk, or pleasantry (e.g. "hi", "hello", "good morning", "how are you", "thanks")
+MEDICAL - if it mentions, asks about, or claims something related to health, illness, medicine, treatment, symptoms, or a health rumor
+OTHER - anything else not related to health (e.g. asking for directions, prices, jokes, general chit-chat unrelated to health)
+
+Message: "${text}"
+
+Category:`;
+
+  const result = await model.generateContent(prompt);
+  const label = result.response.text().trim().toUpperCase();
+
+  if (label.includes("GREETING")) return "GREETING";
+  if (label.includes("MEDICAL")) return "MEDICAL";
+  return "OTHER";
+}
+
 async function findBestMatch(embedding: number[]) {
   const vectorLiteral = `[${embedding.join(",")}]`;
   const { rows } = await pool.query(
@@ -32,7 +52,7 @@ async function findBestMatch(embedding: number[]) {
 
 async function generateReply(fact: string, source: string, userQuestion: string): Promise<string> {
   const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-  const prompt = `You are a WhatsApp health-information assistant for Nigerian users, replying in plain, warm, simple language (mix of English and Pidgin is fine if the user's question suggests it). 
+  const prompt = `You are a WhatsApp/Telegram health-information assistant for Nigerian users, replying in plain, warm, simple language (mix of English and Pidgin is fine if the user's question suggests it).
 A user asked: "${userQuestion}"
 The verified fact to base your reply on is: "${fact}"
 Source: ${source}
@@ -65,6 +85,16 @@ async function logQuery(
 }
 
 export async function handleIncomingQuestion(phoneNumber: string, questionText: string): Promise<string> {
+  const intent = await classifyIntent(questionText);
+
+  if (intent === "GREETING") {
+    return "Hello! 🌿 I'm SabiHealth. Send me any health claim or rumor you've heard, and I'll check it against verified facts. For example: \"my aunty said herbs can cure malaria instead of drugs.\"";
+  }
+
+  if (intent === "OTHER") {
+    return "I'm built specifically to check health claims and rumors — that one's outside what I can help with. Try asking me something like a health rumor you've heard, and I'll check it against verified facts.";
+  }
+
   const embedding = await embedQuery(questionText);
   const match = await findBestMatch(embedding);
 
