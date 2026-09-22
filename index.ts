@@ -27,6 +27,53 @@ async function sendTelegramMessage(chatId: number | string, text: string) {
   }
 }
 
+interface TelegramFileResponse {
+  ok: boolean;
+  result?: {
+    file_id?: string;
+    file_path?: string;
+  };
+  description?: string;
+}
+
+interface GroqTranscriptionResponse {
+  text: string;
+}
+
+async function transcribeVoice(fileId: string): Promise<string> {
+  // 1. Get the file path from Telegram
+  const fileInfoRes = await fetch(`${TELEGRAM_API}/getFile?file_id=${fileId}`);
+  const fileInfo = (await fileInfoRes.json()) as TelegramFileResponse;
+  if (!fileInfo.ok || !fileInfo.result?.file_path) {
+    throw new Error(`Telegram getFile failed: ${JSON.stringify(fileInfo)}`);
+  }
+  const filePath = fileInfo.result.file_path;
+
+  // 2. Download the actual audio (.ogg/Opus format)
+  const audioUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+  const audioRes = await fetch(audioUrl);
+  const audioBuffer = await audioRes.arrayBuffer();
+
+  // 3. Send to Groq's Whisper endpoint for transcription
+  const formData = new FormData();
+  formData.append("file", new Blob([audioBuffer], { type: "audio/ogg" }), "voice.ogg");
+  formData.append("model", "whisper-large-v3-turbo");
+
+  const groqRes = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+    body: formData,
+  });
+
+  if (!groqRes.ok) {
+    const errText = await groqRes.text();
+    throw new Error(`Groq transcription failed (${groqRes.status}): ${errText}`);
+  }
+
+  const result = (await groqRes.json()) as GroqTranscriptionResponse;
+  return result.text;
+}
+
 app.use(express.json());
 
 app.get("/", (_req: Request, res: Response) => {
@@ -40,14 +87,19 @@ app.post("/webhook", (req: Request, res: Response) => {
 
   const message = req.body?.message;
   const chatId = message?.chat?.id;
-  const text = (message?.text || "").trim();
+  const voice = message?.voice;
+  let text = (message?.text || "").trim();
 
   console.log(`\n📥 Incoming Telegram message:`);
   console.log(`   Chat ID: ${chatId}`);
-  console.log(`   Text: "${text}"`);
+  if (voice) {
+    console.log(`   Voice note received (file_id: ${voice.file_id})`);
+  } else {
+    console.log(`   Text: "${text}"`);
+  }
 
-  if (!chatId || !text) {
-    console.warn("⚠️  Received update with no chat id or text. Ignoring (may be a non-text update).");
+  if (!chatId || (!text && !voice)) {
+    console.warn("⚠️  Received update with no chat id, text, or voice. Ignoring (may be an unsupported update type).");
     return;
   }
 
@@ -66,6 +118,16 @@ app.post("/webhook", (req: Request, res: Response) => {
 
   (async () => {
     try {
+      if (voice) {
+        console.log(`⏳ Transcribing voice note for chat ${chatId}...`);
+        text = await transcribeVoice(voice.file_id);
+        console.log(`📝 Transcribed text: "${text}"`);
+        if (!text) {
+          await sendTelegramMessage(chatId, "Sorry, I couldn't understand that voice note. Could you try typing your question instead?");
+          return;
+        }
+      }
+
       console.log(`⏳ Processing query for chat ${chatId}...`);
       const reply = await handleIncomingQuestion(String(chatId), text);
       await sendTelegramMessage(chatId, reply);
