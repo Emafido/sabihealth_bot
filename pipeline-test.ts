@@ -6,7 +6,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
 const CONFIDENCE_THRESHOLD = 0.65;
-const GROQ_CHAT_MODEL = "llama-3.1-8b-instant";
+const GROQ_CHAT_MODEL = "openai/gpt-oss-20b";
 
 async function withRetry<T>(fn: () => Promise<T>, retries = 2, delayMs = 1000): Promise<T> {
   try {
@@ -29,7 +29,16 @@ function isObviousGreeting(text: string): boolean {
   return GREETING_PATTERN.test(text.trim());
 }
 
-async function groqChat(systemPrompt: string, userPrompt: string, maxTokens = 300): Promise<string> {
+interface GroqChatCompletionResponse {
+  choices?: Array<{
+    message?: {
+      content?: string | null;
+      reasoning?: string | null;
+    };
+  }>;
+}
+
+async function groqChat(systemPrompt: string, userPrompt: string, maxTokens = 300, reasoningEffort: "low" | "medium" | "high" = "low"): Promise<string> {
   return withRetry(async () => {
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
@@ -45,6 +54,7 @@ async function groqChat(systemPrompt: string, userPrompt: string, maxTokens = 30
         ],
         temperature: 0.4,
         max_tokens: maxTokens,
+        reasoning_effort: reasoningEffort,
       }),
     });
 
@@ -55,8 +65,9 @@ async function groqChat(systemPrompt: string, userPrompt: string, maxTokens = 30
       throw err;
     }
 
-    const data = await res.json();
-    return data.choices?.[0]?.message?.content?.trim() ?? "";
+    const data = (await res.json()) as GroqChatCompletionResponse;
+    const message = data.choices?.[0]?.message;
+    return (message?.content || message?.reasoning || "").trim();
   });
 }
 
@@ -79,7 +90,7 @@ MEDICAL - mentions health, illness, medicine, treatment, symptoms, or a health r
 OTHER - anything else unrelated to health
 Reply with ONLY the single category word, nothing else.`;
 
-  const label = (await groqChat(systemPrompt, text, 5)).toUpperCase();
+  const label = (await groqChat(systemPrompt, text, 100, "low")).toUpperCase();
 
   if (label.includes("GREETING")) return "GREETING";
   if (label.includes("MEDICAL")) return "MEDICAL";
