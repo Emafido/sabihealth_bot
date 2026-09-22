@@ -6,6 +6,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
 const CONFIDENCE_THRESHOLD = 0.65;
+const GROQ_CHAT_MODEL = "llama-3.1-8b-instant";
 
 async function withRetry<T>(fn: () => Promise<T>, retries = 2, delayMs = 1000): Promise<T> {
   try {
@@ -13,7 +14,7 @@ async function withRetry<T>(fn: () => Promise<T>, retries = 2, delayMs = 1000): 
   } catch (err: any) {
     const isRetryable = err?.status === 503 || err?.status === 429;
     if (retries > 0 && isRetryable) {
-      console.warn(`⚠️  Gemini call failed (${err?.status}), retrying in ${delayMs}ms... (${retries} left)`);
+      console.warn(`⚠️  Call failed (${err?.status}), retrying in ${delayMs}ms... (${retries} left)`);
       await new Promise((res) => setTimeout(res, delayMs));
       return withRetry(fn, retries - 1, delayMs * 2);
     }
@@ -28,6 +29,38 @@ function isObviousGreeting(text: string): boolean {
   return GREETING_PATTERN.test(text.trim());
 }
 
+async function groqChat(systemPrompt: string, userPrompt: string, maxTokens = 300): Promise<string> {
+  return withRetry(async () => {
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: GROQ_CHAT_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        temperature: 0.4,
+        max_tokens: maxTokens,
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      const err: any = new Error(`Groq chat failed (${res.status}): ${errText}`);
+      err.status = res.status;
+      throw err;
+    }
+
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content?.trim() ?? "";
+  });
+}
+
+// Embeddings stay on Gemini — no quota issues seen here, and gemini-embedding-001 is well-suited for this
 async function embedQuery(text: string): Promise<number[]> {
   return withRetry(async () => {
     const model = genAI.getGenerativeModel({ model: "gemini-embedding-001" });
@@ -40,27 +73,17 @@ async function embedQuery(text: string): Promise<number[]> {
 }
 
 async function classifyIntent(text: string): Promise<"GREETING" | "MEDICAL" | "OTHER"> {
-  return withRetry(async () => {
-    const model = genAI.getGenerativeModel({
-      model: "gemini-flash-latest",
-      generationConfig: { maxOutputTokens: 5 }, // force a fast, short response
-    });
-    const prompt = `Classify this message into exactly ONE word: GREETING, MEDICAL, or OTHER.
-
+  const systemPrompt = `Classify the user's message into exactly ONE word: GREETING, MEDICAL, or OTHER.
 GREETING - greeting or pleasantry (e.g. "hi", "how are you", "thanks")
 MEDICAL - mentions health, illness, medicine, treatment, symptoms, or a health rumor/claim
 OTHER - anything else unrelated to health
+Reply with ONLY the single category word, nothing else.`;
 
-Message: "${text}"
-Category (one word only):`;
+  const label = (await groqChat(systemPrompt, text, 5)).toUpperCase();
 
-    const result = await model.generateContent(prompt);
-    const label = result.response.text().trim().toUpperCase();
-
-    if (label.includes("GREETING")) return "GREETING";
-    if (label.includes("MEDICAL")) return "MEDICAL";
-    return "OTHER";
-  });
+  if (label.includes("GREETING")) return "GREETING";
+  if (label.includes("MEDICAL")) return "MEDICAL";
+  return "OTHER";
 }
 
 async function findBestMatch(embedding: number[]) {
@@ -78,18 +101,14 @@ async function findBestMatch(embedding: number[]) {
 }
 
 async function generateReply(fact: string, source: string, userQuestion: string): Promise<string> {
-  return withRetry(async () => {
-    const model = genAI.getGenerativeModel({ model: "gemini-flash-latest" });
-    const prompt = `You are a WhatsApp/Telegram health-information assistant for Nigerian users, replying in plain, warm, simple language (mix of English and Pidgin is fine if the user's question suggests it).
-A user asked: "${userQuestion}"
-The verified fact to base your reply on is: "${fact}"
-Source: ${source}
-
+  const systemPrompt = `You are a WhatsApp/Telegram health-information assistant for Nigerian users, replying in plain, warm, simple language (mix of English and Pidgin is fine if the user's question suggests it).
 If the verified fact confirms the user's claim is TRUE, affirm it clearly and warmly, adding useful context from the fact. If the verified fact shows the user's claim is FALSE or a myth, correct it gently without being preachy. Either way, cite the source naturally. Keep it short (3-5 sentences max), plain language, no medical jargon.`;
 
-    const result = await model.generateContent(prompt);
-    return result.response.text();
-  });
+  const userPrompt = `User asked: "${userQuestion}"
+Verified fact: "${fact}"
+Source: ${source}`;
+
+  return groqChat(systemPrompt, userPrompt, 300);
 }
 
 async function logSubmission(phoneNumber: string, rumorText: string) {
@@ -114,13 +133,11 @@ async function logQuery(
 }
 
 export async function handleIncomingQuestion(phoneNumber: string, questionText: string): Promise<string> {
-  // Fast path: skip all API calls for obvious greetings
   if (isObviousGreeting(questionText)) {
     return "Hello! 🌿 I'm SabiHealth. Send me any health claim or rumor you've heard, and I'll check it against verified facts. For example: \"my aunty said herbs can cure malaria instead of drugs.\"";
   }
 
-  // Run classification and embedding in parallel — they're independent of each other,
-  // so no need to wait for one before starting the other.
+  // Classification (Groq) and embedding (Gemini) run in parallel — independent of each other
   const [intent, embedding] = await Promise.all([
     classifyIntent(questionText),
     embedQuery(questionText),
