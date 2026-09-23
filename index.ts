@@ -15,11 +15,19 @@ if (!BOT_TOKEN) {
 
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
-async function sendTelegramMessage(chatId: number | string, text: string) {
+async function sendTelegramMessage(
+  chatId: number | string,
+  text: string,
+  replyMarkup?: Record<string, unknown>
+) {
+  const body: Record<string, unknown> = { chat_id: chatId, text };
+  if (replyMarkup) {
+    body.reply_markup = replyMarkup;
+  }
   const res = await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     const errText = await res.text();
@@ -103,34 +111,55 @@ function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lon2: num
   return R * c;
 }
 
+async function fetchOverpassData(query: string): Promise<OverpassResponse> {
+  const endpoints = [
+    "https://overpass-api.de/api/interpreter",
+    "https://z.overpass-api.de/api/interpreter",
+  ];
+
+  let lastError: unknown = null;
+
+  for (const endpoint of endpoints) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": "SabiHealthBot/1.0 (+https://t.me/sabihealth)",
+        },
+        body: "data=" + encodeURIComponent(query),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        throw new Error(`Overpass endpoint ${endpoint} failed with HTTP ${res.status}`);
+      }
+
+      const text = await res.text();
+      return JSON.parse(text) as OverpassResponse;
+    } catch (err) {
+      console.warn(`⚠️ Overpass query to ${endpoint} failed, trying next mirror:`, err);
+      lastError = err;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw lastError || new Error("All Overpass endpoints failed.");
+}
+
 async function handleNearbyHospitals(chatId: number | string, userLat: number, userLon: number): Promise<void> {
-  const query = `[out:json];
+  const query = `[out:json][timeout:15];
 (
   node["amenity"="hospital"](around:5000,${userLat},${userLon});
   node["amenity"="clinic"](around:5000,${userLat},${userLon});
 );
 out body;`;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
-
-  let data: OverpassResponse;
-  try {
-    const res = await fetch("https://overpass-api.de/api/interpreter", {
-      method: "POST",
-      body: query,
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      throw new Error(`Overpass API responded with HTTP ${res.status}`);
-    }
-
-    const text = await res.text();
-    data = JSON.parse(text) as OverpassResponse;
-  } finally {
-    clearTimeout(timeout);
-  }
+  const data = await fetchOverpassData(query);
 
   const elements = data.elements || [];
   const withDistance = elements
@@ -206,12 +235,54 @@ app.post("/webhook", (req: Request, res: Response) => {
     const introMessage =
       "🌿 Welcome to SabiHealth!\n\n" +
       "Heard a health claim from a friend, family member, or online and not sure if it's true? Just type it here in plain English or Pidgin, and I'll check it against verified facts from WHO, NCDC, and NPHCDA.\n\n" +
+      "📍 Looking for nearby clinics or hospitals? Tap the '📍 Share Location for Nearby Hospitals' button below.\n\n" +
       "If I'm not sure, I'll say so honestly instead of guessing — and I'll flag it for our team to look into.\n\n" +
       "Try something like:\n" +
       "\"My aunty said herbs can cure malaria instead of drugs\"";
-    sendTelegramMessage(chatId, introMessage).catch((err) =>
+
+    const keyboard = {
+      keyboard: [
+        [{ text: "📍 Share Location for Nearby Hospitals", request_location: true }],
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false,
+    };
+
+    sendTelegramMessage(chatId, introMessage, keyboard).catch((err) =>
       console.error(`❌ Failed to send intro message to chat ${chatId}:`, err)
     );
+    return;
+  }
+
+  if (text.startsWith("/testlocation")) {
+    const parts = text.split(" ").filter(Boolean);
+    let testLat = 6.5244;
+    let testLon = 3.3792;
+    if (parts.length >= 3) {
+      const parsedLat = parseFloat(parts[1] || "");
+      const parsedLon = parseFloat(parts[2] || "");
+      if (!isNaN(parsedLat) && !isNaN(parsedLon)) {
+        testLat = parsedLat;
+        testLon = parsedLon;
+      }
+    }
+
+    (async () => {
+      try {
+        console.log(`⏳ Finding nearby hospitals for chat ${chatId} (test location: lat=${testLat}, lon=${testLon})...`);
+        await handleNearbyHospitals(chatId, testLat, testLon);
+      } catch (error) {
+        console.error(`❌ Error finding nearby hospitals for chat ${chatId}:`, error);
+        try {
+          await sendTelegramMessage(
+            chatId,
+            "Sorry, I couldn't look up nearby hospitals right now. Please try again shortly."
+          );
+        } catch (fallbackError) {
+          console.error(`❌ Failed to send fallback message to chat ${chatId}:`, fallbackError);
+        }
+      }
+    })();
     return;
   }
 
