@@ -144,9 +144,32 @@ async function logQuery(
   );
 }
 
+export function isHospitalOrDoctorRequest(text: string): boolean {
+  const clean = text.toLowerCase().trim();
+
+  // Facility keywords
+  const facilityKeywords = /\b(hospital|clinic|doctor|pharmacy|chemist|health\s?cent(er|re)|medical\s?cent(er|re)|emergency\s?room|er|urgent\s?care)\b/i;
+
+  // Action or care-seeking keywords
+  const actionKeywords = /\b(get\s?to|go\s?to|find|locate|nearest|near\s?me|closest|around|where\s?is|where\s?can|see\s?a|visit|need|want|look(ing)?\s?for|take\s?me|reach|search|call)\b/i;
+
+  // Direct short queries
+  const directQueries = /^(hospital|clinic|doctor|nearby\s?hospital|nearby\s?clinic|find\s?hospital|hospital\s?near\s?me)[\s!.?]*$/i;
+
+  if (directQueries.test(clean)) {
+    return true;
+  }
+
+  return facilityKeywords.test(clean) && actionKeywords.test(clean);
+}
+
 export async function handleIncomingQuestion(phoneNumber: string, questionText: string): Promise<string> {
   if (isObviousGreeting(questionText)) {
     return "Hello! 🌿 I'm SabiHealth. Send me any health claim or rumor you've heard, and I'll check it against verified facts. For example: \"my aunty said herbs can cure malaria instead of drugs.\"";
+  }
+
+  if (isHospitalOrDoctorRequest(questionText)) {
+    return "🏥 To help you find the closest hospitals and clinics near you, please share your location!\n\n📱 On mobile: Tap the '📍 Share Location for Nearby Hospitals' button below (or tap the paperclip 📎 and select Location).\n\n💻 On Web/Desktop: Type /testlocation to find facilities.\n\n🚨 If this is a medical emergency, please call 112 (National Emergency toll-free) or 767 (in Lagos) immediately, or go to the nearest emergency room right away.";
   }
 
   // Classification (Groq) and embedding (Gemini) run in parallel — independent of each other
