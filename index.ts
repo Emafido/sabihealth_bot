@@ -74,6 +74,99 @@ async function transcribeVoice(fileId: string): Promise<string> {
   return result.text;
 }
 
+interface TelegramLocation {
+  latitude: number;
+  longitude: number;
+}
+
+interface OverpassElement {
+  type: string;
+  id: number;
+  lat: number;
+  lon: number;
+  tags?: Record<string, string>;
+}
+
+interface OverpassResponse {
+  elements?: OverpassElement[];
+}
+
+function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371; // Earth's radius in kilometers
+  const toRad = (deg: number) => (deg * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
+async function handleNearbyHospitals(chatId: number | string, userLat: number, userLon: number): Promise<void> {
+  const query = `[out:json];
+(
+  node["amenity"="hospital"](around:5000,${userLat},${userLon});
+  node["amenity"="clinic"](around:5000,${userLat},${userLon});
+);
+out body;`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+
+  let data: OverpassResponse;
+  try {
+    const res = await fetch("https://overpass-api.de/api/interpreter", {
+      method: "POST",
+      body: query,
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      throw new Error(`Overpass API responded with HTTP ${res.status}`);
+    }
+
+    const text = await res.text();
+    data = JSON.parse(text) as OverpassResponse;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const elements = data.elements || [];
+  const withDistance = elements
+    .filter((el) => typeof el.lat === "number" && typeof el.lon === "number")
+    .map((el) => ({
+      name: el.tags?.name?.trim() || "Unnamed hospital/clinic",
+      lat: el.lat,
+      lon: el.lon,
+      distanceKm: calculateDistanceKm(userLat, userLon, el.lat, el.lon),
+    }));
+
+  if (withDistance.length === 0) {
+    await sendTelegramMessage(
+      chatId,
+      "I couldn't find any hospitals nearby in my current data. Please try a nearby town's name, or contact a local health worker for the nearest facility."
+    );
+    console.log(`📤 Reply sent to chat ${chatId} (no nearby hospitals found)`);
+    return;
+  }
+
+  withDistance.sort((a, b) => a.distanceKm - b.distanceKm);
+  const closest = withDistance.slice(0, 3);
+
+  const itemsText = closest
+    .map(
+      (item, idx) =>
+        `${idx + 1}. ${item.name} — ${item.distanceKm.toFixed(1)}km away\n   https://www.google.com/maps?q=${item.lat},${item.lon}`
+    )
+    .join("\n\n");
+
+  const reply = `Here are the closest hospitals/clinics I found:\n\n${itemsText}\n\nIf it's urgent, please call emergency services or go to the nearest facility right away.`;
+
+  await sendTelegramMessage(chatId, reply);
+  console.log(`📤 Reply sent to chat ${chatId} (found ${closest.length} nearby facilities)`);
+}
+
 app.use(express.json());
 
 app.get("/", (_req: Request, res: Response) => {
@@ -88,18 +181,24 @@ app.post("/webhook", (req: Request, res: Response) => {
   const message = req.body?.message;
   const chatId = message?.chat?.id;
   const voice = message?.voice;
+  const location = message?.location as TelegramLocation | undefined;
   let text = (message?.text || "").trim();
+
+  const hasLocation =
+    typeof location?.latitude === "number" && typeof location?.longitude === "number";
 
   console.log(`\n📥 Incoming Telegram message:`);
   console.log(`   Chat ID: ${chatId}`);
-  if (voice) {
+  if (hasLocation) {
+    console.log(`   Location: lat=${location!.latitude}, lon=${location!.longitude}`);
+  } else if (voice) {
     console.log(`   Voice note received (file_id: ${voice.file_id})`);
   } else {
     console.log(`   Text: "${text}"`);
   }
 
-  if (!chatId || (!text && !voice)) {
-    console.warn("⚠️  Received update with no chat id, text, or voice. Ignoring (may be an unsupported update type).");
+  if (!chatId || (!text && !voice && !hasLocation)) {
+    console.warn("⚠️  Received update with no chat id, text, voice, or location. Ignoring (may be an unsupported update type).");
     return;
   }
 
@@ -113,6 +212,26 @@ app.post("/webhook", (req: Request, res: Response) => {
     sendTelegramMessage(chatId, introMessage).catch((err) =>
       console.error(`❌ Failed to send intro message to chat ${chatId}:`, err)
     );
+    return;
+  }
+
+  if (hasLocation) {
+    (async () => {
+      try {
+        console.log(`⏳ Finding nearby hospitals for chat ${chatId}...`);
+        await handleNearbyHospitals(chatId, location!.latitude, location!.longitude);
+      } catch (error) {
+        console.error(`❌ Error finding nearby hospitals for chat ${chatId}:`, error);
+        try {
+          await sendTelegramMessage(
+            chatId,
+            "Sorry, I couldn't look up nearby hospitals right now. Please try again shortly."
+          );
+        } catch (fallbackError) {
+          console.error(`❌ Failed to send fallback message to chat ${chatId}:`, fallbackError);
+        }
+      }
+    })();
     return;
   }
 
