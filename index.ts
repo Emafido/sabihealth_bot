@@ -1,5 +1,7 @@
 import express, { type Request, type Response } from "express";
 import dotenv from "dotenv";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { Pool } from "pg";
 import { handleIncomingQuestion } from "./pipeline-test";
 
 dotenv.config();
@@ -14,6 +16,81 @@ if (!BOT_TOKEN) {
 }
 
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
+
+// Initialize Supabase JS client and Postgres Pool
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://ualdjxgpazmryjnlzbnd.supabase.co";
+const SUPABASE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.SUPABASE_KEY;
+
+const supabase: SupabaseClient | null = (SUPABASE_URL && SUPABASE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_KEY)
+  : null;
+
+if (supabase) {
+  console.log("⚡ Supabase JS client initialized.");
+} else {
+  console.log("ℹ️  SUPABASE_KEY not set in environment; logging will use DATABASE_URL pool fallback.");
+}
+
+const dbPool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
+
+async function saveQueryLog(params: {
+  phoneNumber: string | number;
+  questionText: string;
+  matchedFactId?: number | null;
+  confidenceScore?: number | null;
+  escalated?: boolean;
+}): Promise<void> {
+  const {
+    phoneNumber,
+    questionText,
+    matchedFactId = null,
+    confidenceScore = 0,
+    escalated = false,
+  } = params;
+
+  // 1. Try @supabase/supabase-js first if client is initialized
+  if (supabase) {
+    try {
+      const { error } = await supabase.from("queries_log").insert({
+        phone_number: String(phoneNumber),
+        question_text: questionText,
+        matched_fact_id: matchedFactId,
+        confidence_score: confidenceScore,
+        escalated: escalated,
+      });
+      if (error) {
+        console.warn(`⚠️  @supabase/supabase-js insert warning: ${error.message}`);
+      } else {
+        console.log(`💾 Saved message to Supabase via supabase-js for chat ${phoneNumber}`);
+        return;
+      }
+    } catch (err: any) {
+      console.warn(`⚠️  @supabase/supabase-js insert error: ${err.message}`);
+    }
+  }
+
+  // 2. Direct Postgres pool fallback
+  if (dbPool) {
+    try {
+      await dbPool.query(
+        `INSERT INTO queries_log (phone_number, question_text, matched_fact_id, confidence_score, escalated)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [String(phoneNumber), questionText, matchedFactId, confidenceScore, escalated]
+      );
+      console.log(`💾 Saved message to Supabase via db pool for chat ${phoneNumber}`);
+    } catch (dbErr: any) {
+      console.error(`❌ Failed to save to Supabase queries_log: ${dbErr.message}`);
+    }
+  }
+}
 
 async function sendTelegramMessage(
   chatId: number | string,
@@ -236,10 +313,36 @@ async function handleNearbyHospitals(chatId: number | string, userLat: number, u
     )
     .join("\n\n");
 
-  const reply = `Here are the closest hospitals/clinics I found:\n\n${itemsText}\n\nIf it's urgent, please call emergency services or go to the nearest facility right away.`;
+  const reply = `Here are the closest hospitals/clinics I found:\n\n${itemsText}\n\n🚨 If it's urgent, please call emergency services (112, or 767 in Lagos) or go to the nearest facility right away.`;
 
   await sendTelegramMessage(chatId, reply);
   console.log(`📤 Reply sent to chat ${chatId} (found ${closest.length} nearby facilities)`);
+
+  await saveQueryLog({
+    phoneNumber: chatId,
+    questionText: `[Location shared: lat=${userLat}, lon=${userLon}]`,
+    confidenceScore: 1.0,
+    escalated: false,
+  });
+}
+
+function isHospitalOrDoctorRequest(text: string): boolean {
+  const clean = text.toLowerCase().trim();
+
+  // Facility keywords
+  const facilityKeywords = /\b(hospital|clinic|doctor|pharmacy|chemist|health\s?cent(er|re)|medical\s?cent(er|re)|emergency\s?room|er|urgent\s?care)\b/i;
+
+  // Action or care-seeking keywords
+  const actionKeywords = /\b(get\s?to|go\s?to|find|locate|nearest|near\s?me|closest|around|where\s?is|where\s?can|see\s?a|visit|need|want|look(ing)?\s?for|take\s?me|reach|search|call)\b/i;
+
+  // Direct short queries
+  const directQueries = /^(hospital|clinic|doctor|nearby\s?hospital|nearby\s?clinic|find\s?hospital|hospital\s?near\s?me)[\s!.?]*$/i;
+
+  if (directQueries.test(clean)) {
+    return true;
+  }
+
+  return facilityKeywords.test(clean) && actionKeywords.test(clean);
 }
 
 app.use(express.json());
@@ -368,6 +471,37 @@ app.post("/webhook", (req: Request, res: Response) => {
     return;
   }
 
+  if (isHospitalOrDoctorRequest(text)) {
+    const hospitalPrompt =
+      "🏥 To help you find the closest hospitals and clinics near you, please share your location!\n\n" +
+      "📱 On mobile: Tap the '📍 Share Location for Nearby Hospitals' button below (or tap the paperclip 📎 and select Location).\n\n" +
+      "💻 On Web/Desktop: Type /testlocation to find facilities.\n\n" +
+      "🚨 If this is a medical emergency, please call 112 (National Emergency toll-free) or 767 (in Lagos) immediately, or go to the nearest emergency room right away.";
+
+    const keyboard = {
+      keyboard: [
+        [{ text: "📍 Share Location for Nearby Hospitals", request_location: true }],
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: false,
+    };
+
+    (async () => {
+      try {
+        await sendTelegramMessage(chatId, hospitalPrompt, keyboard);
+        console.log(`📤 Hospital guidance & emergency info sent to chat ${chatId}`);
+        await saveQueryLog({
+          phoneNumber: chatId,
+          questionText: text,
+          escalated: true,
+        });
+      } catch (err) {
+        console.error(`❌ Failed to send hospital guidance to chat ${chatId}:`, err);
+      }
+    })();
+    return;
+  }
+
   (async () => {
     try {
       if (voice) {
@@ -384,6 +518,11 @@ app.post("/webhook", (req: Request, res: Response) => {
       const reply = await handleIncomingQuestion(String(chatId), text);
       await sendTelegramMessage(chatId, reply);
       console.log(`📤 Reply sent to chat ${chatId}`);
+
+      await saveQueryLog({
+        phoneNumber: chatId,
+        questionText: text,
+      });
     } catch (error) {
       console.error(`❌ Error in pipeline processing for chat ${chatId}:`, error);
       try {

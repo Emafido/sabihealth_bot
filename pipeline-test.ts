@@ -2,7 +2,10 @@ import { Pool } from "pg";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import "dotenv/config";
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
 const CONFIDENCE_THRESHOLD = 0.65;
