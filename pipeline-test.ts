@@ -29,15 +29,6 @@ function isObviousGreeting(text: string): boolean {
   return GREETING_PATTERN.test(text.trim());
 }
 
-interface GroqChatCompletionResponse {
-  choices?: Array<{
-    message?: {
-      content?: string | null;
-      reasoning?: string | null;
-    };
-  }>;
-}
-
 async function groqChat(systemPrompt: string, userPrompt: string, maxTokens = 300, reasoningEffort: "low" | "medium" | "high" = "low"): Promise<string> {
   return withRetry(async () => {
     const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -65,9 +56,8 @@ async function groqChat(systemPrompt: string, userPrompt: string, maxTokens = 30
       throw err;
     }
 
-    const data = (await res.json()) as GroqChatCompletionResponse;
-    const message = data.choices?.[0]?.message;
-    return (message?.content || message?.reasoning || "").trim();
+    const data = (await res.json()) as any;
+    return data.choices?.[0]?.message?.content?.trim() ?? "";
   });
 }
 
@@ -90,7 +80,7 @@ MEDICAL - mentions health, illness, medicine, treatment, symptoms, or a health r
 OTHER - anything else unrelated to health
 Reply with ONLY the single category word, nothing else.`;
 
-  const label = (await groqChat(systemPrompt, text, 100, "low")).toUpperCase();
+  const label = (await groqChat(systemPrompt, text, 20, "low")).toUpperCase();
 
   if (label.includes("GREETING")) return "GREETING";
   if (label.includes("MEDICAL")) return "MEDICAL";
@@ -112,14 +102,22 @@ async function findBestMatch(embedding: number[]) {
 }
 
 async function generateReply(fact: string, source: string, userQuestion: string): Promise<string> {
-  const systemPrompt = `You are a WhatsApp/Telegram health-information assistant for Nigerian users, replying in plain, warm, simple language (mix of English and Pidgin is fine if the user's question suggests it).
-If the verified fact confirms the user's claim is TRUE, affirm it clearly and warmly, adding useful context from the fact. If the verified fact shows the user's claim is FALSE or a myth, correct it gently without being preachy. Either way, cite the source naturally. Keep it short (3-5 sentences max), plain language, no medical jargon.`;
+  const systemPrompt = `You are texting a friend on WhatsApp/Telegram to answer a health question — not writing a report. Reply the way a knowledgeable, warm Nigerian friend would text back: short, casual, plain sentences.
+
+Hard rules:
+- NO markdown formatting at all — no asterisks, no bold, no bullet points, no headers.
+- NO formal citation format like "(Source: ...)" — instead, weave the source in naturally mid-sentence, e.g. "WHO says..." or "health guidelines confirm...".
+- NO robotic phrases like "In conclusion" or "It is important to note."
+- Keep it to 2-4 short sentences, like an actual text message.
+- Mix in Pidgin naturally if the user's question suggests it, but don't force it.
+
+If the verified fact confirms the user's claim is TRUE, affirm it warmly. If it shows the claim is FALSE or a myth, correct it gently, no lecturing.`;
 
   const userPrompt = `User asked: "${userQuestion}"
 Verified fact: "${fact}"
 Source: ${source}`;
 
-  return groqChat(systemPrompt, userPrompt, 300);
+  return groqChat(systemPrompt, userPrompt, 300, "low");
 }
 
 async function logSubmission(phoneNumber: string, rumorText: string) {
