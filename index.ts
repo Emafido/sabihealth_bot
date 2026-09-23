@@ -111,17 +111,30 @@ function calculateDistanceKm(lat1: number, lon1: number, lat2: number, lon2: num
   return R * c;
 }
 
-async function fetchOverpassData(query: string): Promise<OverpassResponse> {
+interface HospitalFacility {
+  name: string;
+  lat: number;
+  lon: number;
+  distanceKm: number;
+}
+
+async function fetchNearbyFacilities(userLat: number, userLon: number): Promise<HospitalFacility[]> {
+  // 1. Primary: Query OpenStreetMap Overpass API
+  const query = `[out:json][timeout:10];
+(
+  node["amenity"="hospital"](around:5000,${userLat},${userLon});
+  node["amenity"="clinic"](around:5000,${userLat},${userLon});
+);
+out body;`;
+
   const endpoints = [
     "https://overpass-api.de/api/interpreter",
     "https://z.overpass-api.de/api/interpreter",
   ];
 
-  let lastError: unknown = null;
-
   for (const endpoint of endpoints) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    const timeout = setTimeout(() => controller.abort(), 8000);
 
     try {
       const res = await fetch(endpoint, {
@@ -134,42 +147,75 @@ async function fetchOverpassData(query: string): Promise<OverpassResponse> {
         signal: controller.signal,
       });
 
-      if (!res.ok) {
-        throw new Error(`Overpass endpoint ${endpoint} failed with HTTP ${res.status}`);
+      if (res.ok) {
+        const text = await res.text();
+        const data = JSON.parse(text) as OverpassResponse;
+        if (data.elements && data.elements.length > 0) {
+          return data.elements
+            .filter((el) => typeof el.lat === "number" && typeof el.lon === "number")
+            .map((el) => ({
+              name: el.tags?.name?.trim() || "Unnamed hospital/clinic",
+              lat: el.lat,
+              lon: el.lon,
+              distanceKm: calculateDistanceKm(userLat, userLon, el.lat, el.lon),
+            }));
+        }
       }
-
-      const text = await res.text();
-      return JSON.parse(text) as OverpassResponse;
     } catch (err) {
-      console.warn(`⚠️ Overpass query to ${endpoint} failed, trying next mirror:`, err);
-      lastError = err;
+      console.warn(`⚠️ Overpass query to ${endpoint} failed, trying backup...`);
     } finally {
       clearTimeout(timeout);
     }
   }
 
-  throw lastError || new Error("All Overpass endpoints failed.");
+  // 2. High-availability Fallback: OpenStreetMap Nominatim
+  try {
+    const delta = 0.05; // ~5km
+    const minLon = userLon - delta;
+    const minLat = userLat - delta;
+    const maxLon = userLon + delta;
+    const maxLat = userLat + delta;
+    const viewbox = `${minLon},${maxLat},${maxLon},${minLat}`;
+
+    const [hospRes, clinicRes] = await Promise.all([
+      fetch(
+        `https://nominatim.openstreetmap.org/search?amenity=hospital&format=json&lat=${userLat}&lon=${userLon}&bounded=1&viewbox=${viewbox}&limit=10`,
+        { headers: { "User-Agent": "SabiHealthBot/1.0 (+https://t.me/sabihealth)" } }
+      ),
+      fetch(
+        `https://nominatim.openstreetmap.org/search?amenity=clinic&format=json&lat=${userLat}&lon=${userLon}&bounded=1&viewbox=${viewbox}&limit=10`,
+        { headers: { "User-Agent": "SabiHealthBot/1.0 (+https://t.me/sabihealth)" } }
+      ),
+    ]);
+
+    const hospData = hospRes.ok ? await hospRes.json() : [];
+    const clinicData = clinicRes.ok ? await clinicRes.json() : [];
+    const combined = [...(Array.isArray(hospData) ? hospData : []), ...(Array.isArray(clinicData) ? clinicData : [])];
+
+    if (combined.length > 0) {
+      return combined
+        .map((item: any) => {
+          const lat = parseFloat(item.lat);
+          const lon = parseFloat(item.lon);
+          const name = item.name || item.display_name?.split(",")[0] || "Unnamed hospital/clinic";
+          return {
+            name,
+            lat,
+            lon,
+            distanceKm: calculateDistanceKm(userLat, userLon, lat, lon),
+          };
+        })
+        .filter((item) => !isNaN(item.lat) && !isNaN(item.lon));
+    }
+  } catch (nomErr) {
+    console.warn("⚠️ OSM Nominatim fallback also failed:", nomErr);
+  }
+
+  return [];
 }
 
 async function handleNearbyHospitals(chatId: number | string, userLat: number, userLon: number): Promise<void> {
-  const query = `[out:json][timeout:15];
-(
-  node["amenity"="hospital"](around:5000,${userLat},${userLon});
-  node["amenity"="clinic"](around:5000,${userLat},${userLon});
-);
-out body;`;
-
-  const data = await fetchOverpassData(query);
-
-  const elements = data.elements || [];
-  const withDistance = elements
-    .filter((el) => typeof el.lat === "number" && typeof el.lon === "number")
-    .map((el) => ({
-      name: el.tags?.name?.trim() || "Unnamed hospital/clinic",
-      lat: el.lat,
-      lon: el.lon,
-      distanceKm: calculateDistanceKm(userLat, userLon, el.lat, el.lon),
-    }));
+  const withDistance = await fetchNearbyFacilities(userLat, userLon);
 
   if (withDistance.length === 0) {
     await sendTelegramMessage(
@@ -250,6 +296,22 @@ app.post("/webhook", (req: Request, res: Response) => {
 
     sendTelegramMessage(chatId, introMessage, keyboard).catch((err) =>
       console.error(`❌ Failed to send intro message to chat ${chatId}:`, err)
+    );
+    return;
+  }
+
+  if (
+    text === "📍 Share Location for Nearby Hospitals" ||
+    text.toLowerCase() === "share location"
+  ) {
+    const webNotice =
+      "📍 You are on Telegram Web or Desktop, which does not support one-tap GPS sharing.\n\n" +
+      "👉 To find nearby hospitals right now, type:\n" +
+      "/testlocation\n\n" +
+      "(Or type /testlocation <latitude> <longitude> to test specific coordinates).\n\n" +
+      "📱 On mobile, tap the paperclip icon (📎) or the button to share your live GPS location.";
+    sendTelegramMessage(chatId, webNotice).catch((err) =>
+      console.error(`❌ Failed to send web location notice to chat ${chatId}:`, err)
     );
     return;
   }
