@@ -1,4 +1,4 @@
--- SabiHealth Bot: Database Schema & Seed Data for Supabase
+-- SabiHealth Bot: Complete Database Schema & Seed Data for Supabase
 -- Run this in your Supabase SQL Editor (https://supabase.com/dashboard/project/_/sql)
 
 -- 1. Enable the pgvector extension to work with vector embeddings
@@ -10,15 +10,40 @@ CREATE TABLE IF NOT EXISTS fact_library (
     myth TEXT NOT NULL,
     fact TEXT NOT NULL,
     category TEXT,
-    embedding VECTOR(768), -- Gemini text-embedding-004 uses 768 dimensions
+    embedding VECTOR(768), -- gemini-embedding-001 uses 768 dimensions
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
--- 3. Optional: Create an index for vector similarity search (IVFFlat or HNSW)
--- CREATE INDEX IF NOT EXISTS fact_library_embedding_idx 
--- ON fact_library USING hnsw (embedding vector_cosine_ops);
+-- 3. Create vector similarity search index (HNSW for high-speed nearest-neighbor search)
+CREATE INDEX IF NOT EXISTS fact_library_embedding_idx 
+ON fact_library USING hnsw (embedding vector_cosine_ops);
 
--- 4. Seed the 8 common health myths and facts (if empty)
+-- 4. Create submissions table (for unverified rumors / human-in-the-loop escalation)
+CREATE TABLE IF NOT EXISTS submissions (
+    id SERIAL PRIMARY KEY,
+    phone_number TEXT,
+    rumor_text TEXT NOT NULL,
+    status TEXT DEFAULT 'pending', -- 'pending', 'reviewed', 'verified', 'dismissed'
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- 5. Create queries_log table (audit trail, confidence tracking & analytics)
+CREATE TABLE IF NOT EXISTS queries_log (
+    id SERIAL PRIMARY KEY,
+    phone_number TEXT NOT NULL,
+    question_text TEXT NOT NULL,
+    matched_fact_id INTEGER REFERENCES fact_library(id) ON DELETE SET NULL,
+    confidence_score NUMERIC DEFAULT 0,
+    escalated BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- 6. Indexes for analytics and performance
+CREATE INDEX IF NOT EXISTS idx_queries_log_phone ON queries_log(phone_number);
+CREATE INDEX IF NOT EXISTS idx_queries_log_created_at ON queries_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
+
+-- 7. Seed 8 common Nigerian/African health myths and verified facts (if empty)
 INSERT INTO fact_library (myth, fact, category)
 SELECT * FROM (VALUES
     (
