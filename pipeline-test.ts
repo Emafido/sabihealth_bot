@@ -9,7 +9,7 @@ const pool = new Pool({
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
 
 const CONFIDENCE_THRESHOLD = 0.65;
-const GROQ_CHAT_MODEL = "openai/gpt-oss-20b";
+const GROQ_CHAT_MODEL = process.env.GROQ_CHAT_MODEL || "openai/gpt-oss-20b";
 
 async function withRetry<T>(fn: () => Promise<T>, retries = 2, delayMs = 1000): Promise<T> {
   try {
@@ -60,7 +60,8 @@ async function groqChat(systemPrompt: string, userPrompt: string, maxTokens = 30
     }
 
     const data = (await res.json()) as any;
-    return data.choices?.[0]?.message?.content?.trim() ?? "";
+    const message = data.choices?.[0]?.message;
+    return (message?.content || message?.reasoning || "").trim();
   });
 }
 
@@ -83,11 +84,18 @@ MEDICAL - mentions health, illness, medicine, treatment, symptoms, or a health r
 OTHER - anything else unrelated to health
 Reply with ONLY the single category word, nothing else.`;
 
-  const label = (await groqChat(systemPrompt, text, 20, "low")).toUpperCase();
+  try {
+    const raw = await groqChat(systemPrompt, text, 150, "low");
+    const label = raw.toUpperCase();
 
-  if (label.includes("GREETING")) return "GREETING";
-  if (label.includes("MEDICAL")) return "MEDICAL";
-  return "OTHER";
+    if (label.includes("GREETING")) return "GREETING";
+    if (label.includes("MEDICAL")) return "MEDICAL";
+    if (label.includes("OTHER")) return "OTHER";
+    return "MEDICAL";
+  } catch (err) {
+    console.warn("⚠️ Intent classification error, defaulting to MEDICAL:", err);
+    return "MEDICAL";
+  }
 }
 
 async function findBestMatch(embedding: number[]) {

@@ -499,11 +499,6 @@ app.post("/webhook", (req: Request, res: Response) => {
       const reply = await handleIncomingQuestion(String(chatId), text);
       await sendTelegramMessage(chatId, reply);
       console.log(`📤 Reply sent to chat ${chatId}`);
-
-      await saveQueryLog({
-        phoneNumber: chatId,
-        questionText: text,
-      });
     } catch (error) {
       console.error(`❌ Error in pipeline processing for chat ${chatId}:`, error);
       try {
