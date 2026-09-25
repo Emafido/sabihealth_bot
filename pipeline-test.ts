@@ -158,8 +158,8 @@ export function isHospitalOrDoctorRequest(text: string): boolean {
   // Facility keywords
   const facilityKeywords = /\b(hospital|clinic|doctor|pharmacy|chemist|health\s?cent(er|re)|medical\s?cent(er|re)|emergency\s?room|er|urgent\s?care)\b/i;
 
-  // Action or care-seeking keywords
-  const actionKeywords = /\b(get\s?to|go\s?to|find|locate|nearest|near\s?me|closest|around|where\s?is|where\s?can|see\s?a|visit|need|want|look(ing)?\s?for|take\s?me|reach|search|call)\b/i;
+  // Action or care-seeking keywords (English + Pidgin: where, dey, show, locate, etc.)
+  const actionKeywords = /\b(get\s?to|go\s?to|find|locate|nearest|near\s?me|closest|around|where|see\s?a|visit|need|want|look(ing)?\s?for|take\s?me|reach|search|call|dey|show)\b/i;
 
   // Direct short queries
   const directQueries = /^(hospital|clinic|doctor|nearby\s?hospital|nearby\s?clinic|find\s?hospital|hospital\s?near\s?me)[\s!.?]*$/i;
